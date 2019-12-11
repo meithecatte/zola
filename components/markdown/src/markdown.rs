@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use crate::markdown::cmark::CowStr;
+use crate::markdown::cmark::{CowStr, HeadingLevel};
 use errors::bail;
 use libs::gh_emoji::Replacer as EmojiReplacer;
 use libs::once_cell::sync::Lazy;
@@ -399,6 +399,71 @@ fn convert_footnotes_to_github_style(old_events: &mut Vec<Event>) {
     old_events.push(Event::Html("</ol>\n</section>\n".into()));
 }
 
+/// Accepts `Vec<pulldown_cmark::Event>`, and modifies it so that page/document sections are
+/// wrapped in HTML `<section>` tags.
+///
+/// A `<section>` tag is opened for any new `<h{N}>` tag, and any opened tags will be closed when
+/// a header tag is found which is at an equal or lower level in the hierarchy. (typically we would
+/// say that `<h1>` is "higher" in the hierarchy, but here "level" indicates the degree of nesting)
+fn wrap_page_sections(events : &mut Vec<Event>) -> () {
+    // Keep track of levels we've visited
+    let mut level_stack : Vec<HeadingLevel> = Vec::new();
+    // Keep track of items that have been inserted, so we can find the delta between the index a
+    // Heading had in the initial vector and after modifying it
+    let mut items_added = 0;
+
+    for (n, event) in events.clone().into_iter().enumerate() {
+        match event {
+            // This only needs to be done based on the Start of a Heading
+            Event::Start(Tag::Heading { level: heading_level, .. }) => {
+                if level_stack.len() == 0 {
+                    // Top-level section, open a `<section>` tag
+                    events.insert(n + items_added, Event::Html("<section>".into()));
+                    items_added += 1;
+                    level_stack.push(heading_level);
+                } else {
+                    if &heading_level == level_stack.last().unwrap() {
+                        // close existing section, and open a new one
+                        events.insert(n + items_added, Event::Html("</section><section>".into()));
+                        items_added += 1;
+                        // Note: because the current Heading is at the same level as the previous
+                        // one, we don't have to modify the stack
+                    } else if &heading_level < level_stack.last().unwrap() {
+                        // Closing a lower-level section. Keep closing <section> blocks until the
+                        // top of the stack is the same level
+                        while level_stack.last().unwrap() != &heading_level {
+                            events.insert(n + items_added, Event::Html("</section>".into()));
+                            items_added += 1;
+                            level_stack.pop();
+                        }
+                        events.insert(n + items_added, Event::Html("</section>".into()));
+                        items_added += 1;
+                        level_stack.pop();
+
+                        // Open the new section
+                        events.insert(n + items_added, Event::Html("<section>".into()));
+                        items_added += 1;
+                        level_stack.push(heading_level);
+                    } else {
+                        // Nesting a new section
+                        events.insert(n + items_added, Event::Html("<section>".into()));
+                        items_added += 1;
+                        level_stack.push(heading_level);
+                    }
+                }
+            }
+            // Ignore all events that aren't the Start of a Heading
+            _ => ()
+        }
+    }
+    // Anything left on the stack represents a `<section>` that needs to be closed
+    while level_stack.len() > 0 {
+        events.push(Event::Html("</section>".into()));
+        items_added += 1;
+        level_stack.pop();
+    }
+}
+
 pub fn markdown_to_html(
     content: &str,
     context: &RenderContext,
@@ -718,6 +783,13 @@ pub fn markdown_to_html(
             Event::Text(text) | Event::Html(text) => !text.is_empty(),
             _ => true,
         });
+
+        // If user wants page sections wrapped in <section> tags, we do this before managing
+        // headings. This way we don't interfere with the code that builds an index of Heading
+        // locations.
+        if context.config.markdown.render_with_section_tags {
+            wrap_page_sections(&mut events);
+        }
 
         let heading_refs = get_heading_refs(&events);
 
